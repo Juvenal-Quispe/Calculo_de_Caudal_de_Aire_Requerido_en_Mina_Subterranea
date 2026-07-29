@@ -1,0 +1,1225 @@
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+ TRABAJO FINAL - FUNDAMENTOS DE PROGRAMACION PARA MINERIA
+ Escuela Profesional de Ingenieria de Minas - UNA PUNO
+ Docente: Ing. Edy Huanca Tito
+
+ TEMA N° 30: CALCULO DEL CAUDAL DE AIRE REQUERIDO EN MINA SUBTERRANEA
+ Area: Ventilacion de Minas
+
+ Estudiante : QUISPE HUACCANE JUVENAL FERNANDO
+ Codigo     : 236661
+
+ Objetivo:
+    Determinar el caudal de aire fresco (m3/min) que debe ingresar a cada
+    frente/nivel de una mina subterranea y a la mina en conjunto, evaluando
+    los tres criterios normativos y tecnicos habituales en Peru:
+        1) Requerimiento por personal (Art. 246, D.S. N° 023-2017-EM)
+        2) Requerimiento por potencia de equipo diesel (misma norma)
+        3) Requerimiento por dilucion de gases de combustion (metodo de
+           dilucion de contaminantes, McPherson / Hartman)
+    El caudal de diseno de cada frente es el MAXIMO de los tres criterios,
+    afectado por un factor de fugas/perdidas del circuito.
+================================================================================
+"""
+
+# ==============================================================================
+# SECCION 0: IMPORTACION DE LIBRERIAS
+# ==============================================================================
+import os
+import sys
+import traceback
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")          # backend sin pantalla (servidor / consola)
+import matplotlib.pyplot as plt
+
+from docx import Document
+from docx.shared import Cm, Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml.ns import qn
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, Reference
+from openpyxl.drawing.image import Image as OpenpyxlImage
+
+# ==============================================================================
+# SECCION 1: CONSTANTES NORMATIVAS Y TECNICAS (ajustables)
+# ==============================================================================
+# Reglamento de Seguridad y Salud Ocupacional en Mineria (Peru, D.S. N° 023-2017-EM,
+# que modifica al D.S. N° 024-2016-EM), Art. 246 - Requerimiento minimo de aire.
+Q_MIN_PERSONA = 3.0          # m3/min de aire fresco, minimo por trabajador
+Q_MIN_HP_DIESEL = 3.0        # m3/min de aire fresco, minimo por HP de motor diesel
+FACTOR_FUGAS = 1.25          # factor por fugas/perdidas en el circuito (25%)
+
+# Gases de combustion evaluados: Limite Maximo Permisible (LMP) segun D.S.
+# 023-2017-EM Anexo 8, y concentracion de fondo (ambiental) tipica. Estos SI
+# son constantes normativas/ambientales de referencia. Las CONCENTRACIONES
+# MEDIDAS de cada gas en cada frente (dato de campo, con detector multigas)
+# son un DATO DE ENTRADA que ingresa el usuario (ver Modulo 1), tal como
+# exige la ficha tecnica del tema ("Concentraciones de gases contaminantes").
+LMP_GASES = {
+    "CO":  {"lmp_ppm": 25,   "c_fondo_ppm": 2.0},
+    "NOx": {"lmp_ppm": 3,    "c_fondo_ppm": 0.2},
+    "CO2": {"lmp_ppm": 5000, "c_fondo_ppm": 400.0},
+}
+
+CARPETA_GRAFICOS = "graficos"
+NOMBRE_BASE = "Informe_CaudalAireRequerido_QUISPE_HUACCANE_JUVENAL_FERNANDO"
+
+
+# ==============================================================================
+# SECCION 2: ESTRUCTURAS DE DATOS
+# ==============================================================================
+@dataclass
+class EquipoDiesel:
+    """Representa un equipo diesel operando en un frente/nivel."""
+    nombre: str
+    hp: float
+
+
+@dataclass
+class Frente:
+    """
+    Representa un frente de trabajo o nivel de la mina. Los campos
+    n_trabajadores, equipos (HP) y concentraciones_gases_ppm son los DATOS
+    DE ENTRADA exigidos por la ficha tecnica del Tema N 30:
+        - Numero de trabajadores por guardia
+        - Potencia (HP) de equipos diesel
+        - Concentraciones de gases contaminantes (medidas en campo, ppm)
+    El campo caudal_actual_ppm_m3min es el caudal de aire (m3/min) que
+    circula actualmente en el frente (medido con anemometro/velometro en el
+    punto donde se tomo la lectura de gases), necesario para poder convertir
+    una concentracion medida en un caudal de dilucion requerido.
+    """
+    nombre: str
+    nivel: str
+    n_trabajadores: int
+    equipos: List[EquipoDiesel] = field(default_factory=list)
+    caudal_actual_m3min: float = 0.0
+    concentraciones_gases_ppm: Dict[str, float] = field(default_factory=dict)
+
+    @property
+    def hp_total(self) -> float:
+        return sum(e.hp for e in self.equipos)
+
+
+# ==============================================================================
+# MODULO 1: ENTRADA DE DATOS
+# ==============================================================================
+def _datos_demostrativos() -> List[Frente]:
+    """
+    Conjunto de datos de demostracion, representativo de una pequena/mediana
+    mina subterranea con 4 frentes activos. Sirve para ejecutar el programa
+    sin necesidad de un archivo externo. Los valores de concentracion de
+    gases simulan lecturas de un detector multigas portatil, y el caudal
+    actual simula una lectura de anemometro en el mismo punto de muestreo.
+    El usuario puede reemplazar estos valores editando esta funcion o,
+    preferentemente, entregando un archivo Excel de entrada (ver
+    obtener_datos_entrada / leer_datos_excel).
+    """
+    return [
+        Frente("Rampa Principal", "Nivel 4000", 8,
+               [EquipoDiesel("Scooptram ST-6", 150), EquipoDiesel("Jumbo Electrohidraulico", 120)],
+               caudal_actual_m3min=250,
+               concentraciones_gases_ppm={"CO": 40, "NOx": 4.0, "CO2": 3000}),
+        Frente("Tajeo 1 - Corte y Relleno", "Nivel 3960", 6,
+               [EquipoDiesel("Scooptram ST-3.5", 150)],
+               caudal_actual_m3min=180,
+               concentraciones_gases_ppm={"CO": 15, "NOx": 1.0, "CO2": 2000}),
+        Frente("Crucero 205", "Nivel 3920", 5,
+               [EquipoDiesel("Jumbo Neumatico", 100)],
+               caudal_actual_m3min=200,
+               concentraciones_gases_ppm={"CO": 150, "NOx": 1.2, "CO2": 3200}),
+        Frente("Galeria de Exploracion", "Nivel 3880", 10,
+               [EquipoDiesel("Scooptram ST-6", 150), EquipoDiesel("Dumper Subterraneo", 200)],
+               caudal_actual_m3min=300,
+               concentraciones_gases_ppm={"CO": 35, "NOx": 6.0, "CO2": 7000}),
+    ]
+
+
+def leer_datos_excel(ruta_excel: str) -> List[Frente]:
+    """
+    Modulo 1 - Entrada de Datos (opcion A: archivo Excel).
+
+    Lee los datos de entrada desde un archivo Excel con tres hojas:
+        - "Frentes": columnas [nombre, nivel, n_trabajadores, caudal_actual_m3min]
+        - "Equipos": columnas [frente, equipo, hp]
+        - "Gases"  : columnas [frente, gas, concentracion_ppm]
+    Lanza excepciones descriptivas si el formato es invalido; quien llama a
+    esta funcion decide como manejar el error (ver obtener_datos_entrada).
+    """
+    df_frentes = pd.read_excel(ruta_excel, sheet_name="Frentes")
+    df_equipos = pd.read_excel(ruta_excel, sheet_name="Equipos")
+    df_gases = pd.read_excel(ruta_excel, sheet_name="Gases")
+    return _construir_frentes_desde_dataframes(df_frentes, df_equipos, df_gases, ruta_excel)
+
+
+def leer_datos_csv(carpeta: str) -> List[Frente]:
+    """
+    Modulo 1 - Entrada de Datos (opcion B: archivos CSV).
+
+    Lee los datos de entrada desde tres archivos CSV dentro de 'carpeta':
+        - frentes.csv : columnas nombre,nivel,n_trabajadores,caudal_actual_m3min
+        - equipos.csv : columnas frente,equipo,hp
+        - gases.csv   : columnas frente,gas,concentracion_ppm
+    """
+    ruta_frentes = os.path.join(carpeta, "frentes.csv")
+    ruta_equipos = os.path.join(carpeta, "equipos.csv")
+    ruta_gases = os.path.join(carpeta, "gases.csv")
+    for ruta in (ruta_frentes, ruta_equipos, ruta_gases):
+        if not os.path.exists(ruta):
+            raise FileNotFoundError(f"No se encontro el archivo requerido: {ruta}")
+
+    df_frentes = pd.read_csv(ruta_frentes)
+    df_equipos = pd.read_csv(ruta_equipos)
+    df_gases = pd.read_csv(ruta_gases)
+    return _construir_frentes_desde_dataframes(df_frentes, df_equipos, df_gases, carpeta)
+
+
+def _construir_frentes_desde_dataframes(df_frentes: pd.DataFrame, df_equipos: pd.DataFrame,
+                                         df_gases: pd.DataFrame, origen: str) -> List[Frente]:
+    """Validacion y construccion comun para las entradas via Excel o CSV."""
+    columnas_frentes = {"nombre", "nivel", "n_trabajadores", "caudal_actual_m3min"}
+    columnas_equipos = {"frente", "equipo", "hp"}
+    columnas_gases = {"frente", "gas", "concentracion_ppm"}
+    if not columnas_frentes.issubset(df_frentes.columns):
+        raise ValueError(f"Los datos de 'Frentes' deben tener columnas {columnas_frentes}")
+    if not columnas_equipos.issubset(df_equipos.columns):
+        raise ValueError(f"Los datos de 'Equipos' deben tener columnas {columnas_equipos}")
+    if not columnas_gases.issubset(df_gases.columns):
+        raise ValueError(f"Los datos de 'Gases' deben tener columnas {columnas_gases}")
+
+    frentes = []
+    for _, fila in df_frentes.iterrows():
+        nombre = str(fila["nombre"]).strip()
+        n_trab = int(fila["n_trabajadores"])
+        caudal_actual = float(fila["caudal_actual_m3min"])
+        if n_trab < 0:
+            raise ValueError(f"n_trabajadores negativo en frente '{nombre}'")
+        if caudal_actual <= 0:
+            raise ValueError(f"caudal_actual_m3min debe ser mayor a 0 en frente '{nombre}'")
+
+        equipos_frente = df_equipos[df_equipos["frente"].astype(str).str.strip() == nombre]
+        equipos = []
+        for _, r in equipos_frente.iterrows():
+            hp = float(r["hp"])
+            if hp <= 0:
+                raise ValueError(f"HP invalido para equipo '{r['equipo']}' en frente '{nombre}'")
+            equipos.append(EquipoDiesel(str(r["equipo"]).strip(), hp))
+
+        gases_frente = df_gases[df_gases["frente"].astype(str).str.strip() == nombre]
+        concentraciones = {}
+        for _, r in gases_frente.iterrows():
+            gas = str(r["gas"]).strip()
+            conc = float(r["concentracion_ppm"])
+            if gas not in LMP_GASES:
+                raise ValueError(f"Gas '{gas}' no reconocido (validos: {list(LMP_GASES)})")
+            if conc < 0:
+                raise ValueError(f"Concentracion negativa para '{gas}' en frente '{nombre}'")
+            concentraciones[gas] = conc
+
+        frentes.append(Frente(nombre=nombre, nivel=str(fila["nivel"]).strip(),
+                               n_trabajadores=n_trab, equipos=equipos,
+                               caudal_actual_m3min=caudal_actual,
+                               concentraciones_gases_ppm=concentraciones))
+
+    if not frentes:
+        raise ValueError("No se encontraron frentes validos en el origen de datos.")
+
+    print(f"[INFO] Datos de entrada leidos correctamente desde '{origen}' ({len(frentes)} frentes).")
+    return frentes
+
+
+def leer_datos_teclado() -> List[Frente]:
+    """
+    Modulo 1 - Entrada de Datos (opcion C: captura por teclado).
+
+    Solicita interactivamente, por consola, los datos de cada frente:
+    numero de trabajadores por guardia, equipos diesel (HP), caudal de aire
+    actual medido y concentraciones de gases contaminantes. Incluye
+    validacion de tipo/rango con try/except en cada campo.
+    """
+    frentes: List[Frente] = []
+    print("\n--- CAPTURA DE DATOS POR TECLADO ---")
+    try:
+        n_frentes = int(input("Numero de frentes/niveles a registrar: ").strip())
+    except ValueError:
+        print("[ERROR] Debe ser un numero entero. Se usaran datos de demostracion.")
+        return _datos_demostrativos()
+
+    for i in range(1, n_frentes + 1):
+        print(f"\nFrente #{i}")
+        try:
+            nombre = input("  Nombre del frente/labor: ").strip() or f"Frente {i}"
+            nivel = input("  Nivel: ").strip() or "S/N"
+            n_trab = int(input("  N° de trabajadores por guardia: ").strip())
+            if n_trab < 0:
+                raise ValueError("El numero de trabajadores no puede ser negativo.")
+
+            equipos = []
+            n_equipos = int(input("  N° de equipos diesel en este frente: ").strip() or "0")
+            for j in range(1, n_equipos + 1):
+                nombre_eq = input(f"    Equipo #{j} - nombre: ").strip() or f"Equipo {j}"
+                hp = float(input(f"    Equipo #{j} - potencia (HP): ").strip())
+                if hp <= 0:
+                    raise ValueError("La potencia (HP) debe ser mayor a 0.")
+                equipos.append(EquipoDiesel(nombre_eq, hp))
+
+            caudal_actual = float(input("  Caudal de aire actual medido (m3/min): ").strip())
+            if caudal_actual <= 0:
+                raise ValueError("El caudal actual debe ser mayor a 0.")
+
+            concentraciones = {}
+            print(f"  Concentraciones de gases medidas (deje vacio si no se midio). "
+                  f"Gases disponibles: {list(LMP_GASES)}")
+            for gas in LMP_GASES:
+                valor = input(f"    {gas} (ppm): ").strip()
+                if valor:
+                    conc = float(valor)
+                    if conc < 0:
+                        raise ValueError(f"Concentracion de {gas} no puede ser negativa.")
+                    concentraciones[gas] = conc
+
+            frentes.append(Frente(nombre=nombre, nivel=nivel, n_trabajadores=n_trab,
+                                   equipos=equipos, caudal_actual_m3min=caudal_actual,
+                                   concentraciones_gases_ppm=concentraciones))
+        except Exception as error:
+            print(f"  [ERROR] Dato invalido en el frente #{i}: {error}. Se omite este frente.")
+
+    if not frentes:
+        print("[AVISO] No se registro ningun frente valido por teclado. "
+              "Se usaran datos de demostracion.")
+        return _datos_demostrativos()
+    return frentes
+
+
+def lanzar_formulario_tkinter() -> Optional[List[Frente]]:
+    """
+    Modulo 1 - Entrada de Datos (opcion D, opcional: formulario grafico tkinter).
+
+    Muestra un formulario simple para capturar los datos de UN frente
+    (numero de trabajadores, un equipo diesel, caudal actual y
+    concentraciones de gases). Requiere entorno grafico (no funciona en
+    servidores/consolas sin pantalla); si tkinter no esta disponible o no
+    hay pantalla, se informa y se retorna None para que el programa continue
+    con otra fuente de datos.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+    except Exception as error:
+        print(f"[AVISO] tkinter no disponible ({error}). Se omite el formulario grafico.")
+        return None
+
+    resultado: Dict[str, Frente] = {}
+
+    def _guardar():
+        try:
+            nombre = campo_nombre.get().strip() or "Frente (tkinter)"
+            nivel = campo_nivel.get().strip() or "S/N"
+            n_trab = int(campo_trabajadores.get().strip())
+            hp = float(campo_hp.get().strip())
+            caudal_actual = float(campo_caudal.get().strip())
+            concentraciones = {}
+            for gas, campo in campos_gases.items():
+                valor = campo.get().strip()
+                if valor:
+                    concentraciones[gas] = float(valor)
+            equipos = [EquipoDiesel("Equipo diesel (formulario)", hp)] if hp > 0 else []
+            resultado["frente"] = Frente(nombre=nombre, nivel=nivel, n_trabajadores=n_trab,
+                                          equipos=equipos, caudal_actual_m3min=caudal_actual,
+                                          concentraciones_gases_ppm=concentraciones)
+            ventana.destroy()
+        except Exception as error:
+            messagebox.showerror("Datos invalidos", str(error))
+
+    try:
+        ventana = tk.Tk()
+        ventana.title("Tema 30 - Entrada de datos (formulario simple)")
+        etiquetas_campos = [
+            ("Nombre del frente:", "nombre"), ("Nivel:", "nivel"),
+            ("N° trabajadores por guardia:", "trabajadores"),
+            ("Potencia equipo diesel (HP):", "hp"),
+            ("Caudal actual medido (m3/min):", "caudal"),
+        ]
+        entradas = {}
+        for i, (texto, clave) in enumerate(etiquetas_campos):
+            ttk.Label(ventana, text=texto).grid(row=i, column=0, sticky="w", padx=6, pady=4)
+            entradas[clave] = ttk.Entry(ventana)
+            entradas[clave].grid(row=i, column=1, padx=6, pady=4)
+
+        campo_nombre = entradas["nombre"]
+        campo_nivel = entradas["nivel"]
+        campo_trabajadores = entradas["trabajadores"]
+        campo_hp = entradas["hp"]
+        campo_caudal = entradas["caudal"]
+
+        campos_gases = {}
+        fila_base = len(etiquetas_campos)
+        for k, gas in enumerate(LMP_GASES):
+            ttk.Label(ventana, text=f"Concentracion {gas} (ppm):").grid(
+                row=fila_base + k, column=0, sticky="w", padx=6, pady=4)
+            campos_gases[gas] = ttk.Entry(ventana)
+            campos_gases[gas].grid(row=fila_base + k, column=1, padx=6, pady=4)
+
+        ttk.Button(ventana, text="Guardar y calcular", command=_guardar).grid(
+            row=fila_base + len(LMP_GASES), column=0, columnspan=2, pady=10)
+        ventana.mainloop()
+    except Exception as error:
+        print(f"[AVISO] No se pudo iniciar el formulario grafico ({error}).")
+        return None
+
+    return [resultado["frente"]] if "frente" in resultado else None
+
+
+def crear_plantilla_entrada(ruta: str = "plantilla_datos_entrada.xlsx"):
+    """
+    Genera un archivo Excel de PLANTILLA (con un ejemplo ya cargado) para que
+    el usuario complete sus propios datos y lo use como entrada del programa,
+    manteniendo el mismo formato exigido por leer_datos_excel().
+    """
+    wb = Workbook()
+    ws_f = wb.active
+    ws_f.title = "Frentes"
+    ws_f.append(["nombre", "nivel", "n_trabajadores", "caudal_actual_m3min"])
+    ws_f.append(["Frente Ejemplo", "Nivel 4000", 8, 250])
+
+    ws_e = wb.create_sheet("Equipos")
+    ws_e.append(["frente", "equipo", "hp"])
+    ws_e.append(["Frente Ejemplo", "Scooptram ST-6", 150])
+
+    ws_g = wb.create_sheet("Gases")
+    ws_g.append(["frente", "gas", "concentracion_ppm"])
+    ws_g.append(["Frente Ejemplo", "CO", 40])
+    ws_g.append(["Frente Ejemplo", "NOx", 4])
+    ws_g.append(["Frente Ejemplo", "CO2", 3000])
+
+    for ws in (ws_f, ws_e, ws_g):
+        for col in ws.columns:
+            ancho = max(len(str(c.value)) for c in col) + 4
+            ws.column_dimensions[col[0].column_letter].width = ancho
+
+    wb.save(ruta)
+    print(f"[INFO] Plantilla de entrada generada: {ruta}")
+
+
+def solicitar_metodo_entrada_interactivo() -> List[str]:
+    """
+    Modulo 1 - Entrada de Datos (menu interactivo por terminal).
+
+    Muestra un menu numerado para que el usuario elija, sin necesidad de
+    recordar argumentos de linea de comandos, cual metodo de entrada de
+    datos desea usar. Devuelve una lista de argumentos equivalente a la que
+    se pasaria por consola (compatible con obtener_datos_entrada), de modo
+    que no se duplica ninguna logica de lectura de datos.
+    """
+    print("\n" + "-" * 78)
+    print("SELECCIONE EL METODO DE ENTRADA DE DATOS")
+    print("-" * 78)
+    opciones_texto = {
+        "1": "Datos de demostracion (4 frentes de ejemplo, listo para probar)",
+        "2": "Captura interactiva por teclado (ingresar cada frente manualmente)",
+        "3": "Formulario grafico (tkinter) - un solo frente",
+        "4": "Archivo Excel (.xlsx) con hojas Frentes/Equipos/Gases",
+        "5": "Archivos CSV (frentes.csv, equipos.csv, gases.csv)",
+        "6": "Generar solo la plantilla de entrada (plantilla_datos_entrada.xlsx) y salir",
+    }
+    for clave in ("1", "2", "3", "4", "5", "6"):
+        print(f"  {clave}) {opciones_texto[clave]}")
+
+    while True:
+        eleccion = input("\nIngrese el numero del metodo deseado [1]: ").strip() or "1"
+        if eleccion in opciones_texto:
+            break
+        print("[ERROR] Opcion invalida. Debe ser un numero del 1 al 6.")
+
+    print(f"[INFO] Metodo seleccionado: {opciones_texto[eleccion]}")
+
+    if eleccion == "1":
+        return []
+    if eleccion == "2":
+        return ["--teclado"]
+    if eleccion == "3":
+        return ["--gui"]
+    if eleccion == "4":
+        ruta = input("  Ingrese la ruta del archivo Excel (.xlsx): ").strip()
+        return [ruta] if ruta else []
+    if eleccion == "5":
+        carpeta = input("  Ingrese la carpeta con los CSV (Enter = carpeta actual '.'): ").strip() or "."
+        return ["--csv", carpeta]
+    # eleccion == "6"
+    return ["--plantilla"]
+
+
+def obtener_datos_entrada(argv: List[str]) -> List[Frente]:
+    """
+    Modulo 1 - Entrada de Datos (orquestador).
+
+    Decide la fuente de datos segun los argumentos de linea de comandos:
+        (sin argumentos)          -> datos de demostracion
+        --teclado                 -> captura interactiva por consola
+        --gui                     -> formulario simple tkinter (un frente)
+        --csv <carpeta>           -> lee frentes.csv / equipos.csv / gases.csv
+        <archivo.xlsx>            -> lee el archivo Excel indicado
+    Cualquier error de lectura/formato se captura y se informa, y el
+    programa continua con datos de demostracion para no detener la
+    ejecucion (buena practica de manejo de errores).
+    """
+    try:
+        if len(argv) == 0:
+            print("[INFO] No se especifico fuente de datos. Se usaran datos de demostracion.")
+            return _datos_demostrativos()
+
+        if argv[0] == "--teclado":
+            return leer_datos_teclado()
+
+        if argv[0] == "--gui":
+            datos_gui = lanzar_formulario_tkinter()
+            return datos_gui if datos_gui else _datos_demostrativos()
+
+        if argv[0] == "--csv":
+            carpeta = argv[1] if len(argv) > 1 else "."
+            return leer_datos_csv(carpeta)
+
+        ruta_excel = argv[0]
+        if not os.path.exists(ruta_excel):
+            print(f"[AVISO] No se encontro el archivo '{ruta_excel}'. Se usaran datos de demostracion.")
+            return _datos_demostrativos()
+        return leer_datos_excel(ruta_excel)
+
+    except Exception as error:
+        print(f"[ERROR] No se pudieron leer los datos de entrada: {error}")
+        print("        Se continuara con datos de demostracion.")
+        return _datos_demostrativos()
+
+
+# ==============================================================================
+# MODULO 2: PROCESAMIENTO Y CALCULO
+# ==============================================================================
+def calcular_caudal_personal(n_trabajadores: int) -> float:
+    """Criterio 1: caudal minimo por personal (m3/min)."""
+    return n_trabajadores * Q_MIN_PERSONA
+
+
+def calcular_caudal_diesel(hp_total: float) -> float:
+    """Criterio 2: caudal minimo por potencia de equipo diesel (m3/min)."""
+    return hp_total * Q_MIN_HP_DIESEL
+
+
+def calcular_caudal_dilucion_gases(frente: Frente) -> Dict[str, float]:
+    """
+    Criterio 3: caudal requerido para diluir cada gas contaminante MEDIDO en
+    el frente (dato de entrada) hasta su Limite Maximo Permisible (LMP),
+    mediante la ecuacion de dilucion de contaminantes:
+
+        Q_dilucion = Q_actual x (C_medida - LMP) / (LMP - C_fondo)
+
+    donde Q_actual es el caudal de aire (m3/min) que circulaba en el frente
+    en el momento de la medicion (dato de entrada, anemometro), C_medida es
+    la concentracion de gas contaminante leida con el detector multigas
+    (dato de entrada) y LMP, C_fondo son constantes normativas/ambientales.
+    Si un gas no fue medido en el frente, o su concentracion ya esta dentro
+    del limite, el requerimiento de dilucion para ese gas es 0. Devuelve un
+    diccionario {gas: caudal_m3_min}.
+    """
+    resultados = {}
+    for gas, prop in LMP_GASES.items():
+        c_medida = frente.concentraciones_gases_ppm.get(gas)
+        if c_medida is None:
+            resultados[gas] = 0.0
+            continue
+        lmp = prop["lmp_ppm"]
+        c_fondo = prop["c_fondo_ppm"]
+        denominador = (lmp - c_fondo)
+        if denominador <= 0 or c_medida <= lmp:
+            resultados[gas] = 0.0
+            continue
+        q_dil = frente.caudal_actual_m3min * (c_medida - lmp) / denominador
+        resultados[gas] = max(q_dil, 0.0)
+    return resultados
+
+
+def calcular_caudal_frente(frente: Frente) -> Dict:
+    """Aplica los tres criterios a un frente y determina su caudal de diseno."""
+    q_personal = calcular_caudal_personal(frente.n_trabajadores)
+    q_diesel = calcular_caudal_diesel(frente.hp_total)
+    q_gases = calcular_caudal_dilucion_gases(frente)
+    gas_critico = max(q_gases, key=q_gases.get) if q_gases else "-"
+    q_gases_max = q_gases.get(gas_critico, 0.0)
+
+    q_criterio_max = max(q_personal, q_diesel, q_gases_max)
+    q_diseno = q_criterio_max * FACTOR_FUGAS
+
+    if q_criterio_max == q_personal:
+        criterio_gobernante = "Personal"
+    elif q_criterio_max == q_diesel:
+        criterio_gobernante = "Equipo diesel"
+    else:
+        criterio_gobernante = f"Dilucion de gases ({gas_critico})"
+
+    return {
+        "frente": frente.nombre,
+        "nivel": frente.nivel,
+        "n_trabajadores": frente.n_trabajadores,
+        "hp_total": frente.hp_total,
+        "caudal_actual_m3min": frente.caudal_actual_m3min,
+        "concentraciones_gases_ppm": frente.concentraciones_gases_ppm,
+        "q_personal": q_personal,
+        "q_diesel": q_diesel,
+        "q_gases": q_gases,
+        "q_gases_max": q_gases_max,
+        "gas_critico": gas_critico,
+        "q_criterio_max": q_criterio_max,
+        "criterio_gobernante": criterio_gobernante,
+        "q_diseno": q_diseno,
+    }
+
+
+def calcular_caudal_mina(frentes: List[Frente]) -> Dict:
+    """Modulo 2 (consolidado): calcula el caudal de diseno de la mina completa."""
+    resultados_frentes = [calcular_caudal_frente(f) for f in frentes]
+    q_total_mina = sum(r["q_diseno"] for r in resultados_frentes)
+    return {
+        "resultados_frentes": resultados_frentes,
+        "q_total_mina": q_total_mina,
+        "n_frentes": len(frentes),
+        "trabajadores_total": sum(r["n_trabajadores"] for r in resultados_frentes),
+        "hp_total_mina": sum(r["hp_total"] for r in resultados_frentes),
+    }
+
+
+# ==============================================================================
+# MODULO 3: GENERACION DE GRAFICOS
+# ==============================================================================
+def generar_grafico_caudales(resultado_mina: Dict, carpeta: str = CARPETA_GRAFICOS) -> str:
+    """
+    Genera un grafico de barras agrupadas comparando los tres criterios de
+    caudal y el caudal de diseno final, para cada frente/nivel de la mina.
+    Devuelve la ruta del archivo PNG generado.
+    """
+    os.makedirs(carpeta, exist_ok=True)
+    filas = resultado_mina["resultados_frentes"]
+    etiquetas = [f"{r['frente']}\n({r['nivel']})" for r in filas]
+
+    q_personal = [r["q_personal"] for r in filas]
+    q_diesel = [r["q_diesel"] for r in filas]
+    q_gases = [r["q_gases_max"] for r in filas]
+    q_diseno = [r["q_diseno"] for r in filas]
+
+    x = np.arange(len(etiquetas))
+    ancho = 0.2
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(x - 1.5 * ancho, q_personal, ancho, label="Criterio: Personal", color="#4C72B0")
+    ax.bar(x - 0.5 * ancho, q_diesel, ancho, label="Criterio: Equipo diesel", color="#DD8452")
+    ax.bar(x + 0.5 * ancho, q_gases, ancho, label="Criterio: Dilucion de gases", color="#55A868")
+    ax.bar(x + 1.5 * ancho, q_diseno, ancho, label="Caudal de diseno (con fugas)", color="#C44E52")
+
+    ax.set_ylabel("Caudal de aire (m3/min)")
+    ax.set_title("Caudal de aire requerido por frente/nivel - Comparacion de criterios")
+    ax.set_xticks(x)
+    ax.set_xticklabels(etiquetas, fontsize=8)
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    fig.tight_layout()
+
+    ruta = os.path.join(carpeta, "caudal_por_frente.png")
+    fig.savefig(ruta, dpi=150)
+    plt.close(fig)
+    print(f"[INFO] Grafico generado: {ruta}")
+    return ruta
+
+
+def generar_grafico_torta_criterio(resultado_mina: Dict, carpeta: str = CARPETA_GRAFICOS) -> str:
+    """Grafico adicional: cuantos frentes son gobernados por cada criterio."""
+    os.makedirs(carpeta, exist_ok=True)
+    filas = resultado_mina["resultados_frentes"]
+    conteo: Dict[str, int] = {}
+    for r in filas:
+        clave = r["criterio_gobernante"].split(" (")[0]
+        conteo[clave] = conteo.get(clave, 0) + 1
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.pie(conteo.values(), labels=conteo.keys(), autopct="%1.0f%%", startangle=90,
+           colors=["#4C72B0", "#DD8452", "#55A868"])
+    ax.set_title("Criterio gobernante por frente")
+    fig.tight_layout()
+
+    ruta = os.path.join(carpeta, "criterio_gobernante.png")
+    fig.savefig(ruta, dpi=150)
+    plt.close(fig)
+    print(f"[INFO] Grafico generado: {ruta}")
+    return ruta
+
+
+# ==============================================================================
+# MODULO 6: MODULO DE CALIFICACION (0 A 20) - definido antes de los reportes
+#           para poder incluir su resultado en el informe Word / Excel.
+# ==============================================================================
+def calificar_rubrica(cumplimiento: Optional[Dict[str, float]] = None) -> Dict:
+    """
+    Registra los criterios de la rubrica oficial (Anexo 3 del enunciado) y
+    calcula la nota final (0 a 20). 'cumplimiento' permite indicar, por
+    criterio, la fraccion cumplida (0.0 a 1.0); por defecto se asume
+    cumplimiento total (autodemostrativo). Este modulo NO reemplaza la
+    evaluacion del docente.
+    """
+    rubrica = {
+        "1. Funcionalidad del codigo Python": 6,
+        "2. Correccion tecnica y fundamento del calculo": 4,
+        "3. Generacion automatica de reportes (Word, Excel, graficos)": 4,
+        "4. Memoria de calculo y documentacion": 3,
+        "5. Video sustentatorio (max. 10 min)": 2,
+        "6. Presentacion y cumplimiento de plazo": 1,
+    }
+    if cumplimiento is None:
+        cumplimiento = {clave: 1.0 for clave in rubrica}
+
+    detalle = []
+    nota_final = 0.0
+    for criterio, puntos_max in rubrica.items():
+        frac = max(0.0, min(1.0, cumplimiento.get(criterio, 1.0)))
+        puntos_obtenidos = round(puntos_max * frac, 2)
+        nota_final += puntos_obtenidos
+        detalle.append({
+            "criterio": criterio,
+            "puntos_maximos": puntos_max,
+            "puntos_obtenidos": puntos_obtenidos,
+        })
+
+    if nota_final <= 10:
+        escala = "Desaprobado"
+    elif nota_final <= 13:
+        escala = "Regular"
+    elif nota_final <= 16:
+        escala = "Bueno"
+    else:
+        escala = "Sobresaliente"
+
+    return {"detalle": detalle, "nota_final": round(nota_final, 2), "escala": escala}
+
+
+# ==============================================================================
+# MODULO 4: GENERACION AUTOMATICA DE INFORME WORD
+# ==============================================================================
+def _agregar_tabla(doc: Document, encabezados: List[str], filas: List[List[str]],
+                    ancho_cols_cm: Optional[List[float]] = None):
+    tabla = doc.add_table(rows=1, cols=len(encabezados))
+    tabla.style = "Light Grid Accent 1"
+    tabla.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    hdr_cells = tabla.rows[0].cells
+    for i, texto in enumerate(encabezados):
+        hdr_cells[i].text = str(texto)
+        for p in hdr_cells[i].paragraphs:
+            for run in p.runs:
+                run.bold = True
+
+    for fila in filas:
+        celdas = tabla.add_row().cells
+        for i, valor in enumerate(fila):
+            celdas[i].text = str(valor)
+
+    if ancho_cols_cm:
+        for i, ancho in enumerate(ancho_cols_cm):
+            for row in tabla.rows:
+                row.cells[i].width = Cm(ancho)
+    return tabla
+
+
+def generar_informe_word(frentes: List[Frente], resultado_mina: Dict,
+                          ruta_grafico_barras: str, ruta_grafico_torta: str,
+                          rubrica: Dict, ruta_salida: str):
+    """Modulo 4 - Genera el informe tecnico completo en formato Word (.docx)."""
+    doc = Document()
+
+    estilo_normal = doc.styles["Normal"]
+    estilo_normal.font.name = "Calibri"
+    estilo_normal.font.size = Pt(11)
+
+    # ---------- PORTADA ----------
+    doc.add_paragraph("UNIVERSIDAD NACIONAL DEL ALTIPLANO - PUNO").alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph("Escuela Profesional de Ingenieria de Minas").alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for _ in range(4):
+        doc.add_paragraph()
+
+    titulo = doc.add_heading(
+        "CALCULO DEL CAUDAL DE AIRE REQUERIDO\nEN MINA SUBTERRANEA", level=0)
+    titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    sub = doc.add_paragraph()
+    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = sub.add_run("Tema N° 30 - Ventilacion de Minas\n"
+                       "Curso: Fundamentos de Programacion para Mineria")
+    run.italic = True
+
+    for _ in range(6):
+        doc.add_paragraph()
+
+    datos_portada = [
+        ("Estudiante:", "Quispe Huaccane Juvenal Fernando"),
+        ("Codigo:", "236661"),
+        ("Docente:", "Edy Huanca Tito"),
+        ("Fecha de entrega:", "Jueves 30 de julio de 2026"),
+        ("Puno, Peru:", "2026"),
+    ]
+    for etiqueta, valor in datos_portada:
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run(f"{etiqueta} ").bold = True
+        p.add_run(valor)
+
+    doc.add_page_break()
+
+    # ---------- INTRODUCCION ----------
+    doc.add_heading("1. Introduccion", level=1)
+    doc.add_paragraph(
+        "La ventilacion adecuada de una mina subterranea es una condicion critica "
+        "de seguridad y salud ocupacional: de ella depende el suministro de "
+        "oxigeno a los trabajadores, la dilucion de gases contaminantes generados "
+        "por voladura y equipo diesel, y el control de la temperatura y humedad "
+        "de las labores. El presente informe automatiza el calculo del caudal de "
+        "aire fresco requerido en cada frente de trabajo y en la mina en conjunto, "
+        "aplicando los criterios establecidos en el Reglamento de Seguridad y Salud "
+        "Ocupacional en Mineria del Peru (D.S. N° 023-2017-EM) y el metodo de "
+        "dilucion de contaminantes de uso extendido en ingenieria de ventilacion "
+        "de minas (McPherson, 1993; Hartman et al., 1997)."
+    )
+
+    # ---------- OBJETIVO ----------
+    doc.add_heading("2. Objetivo", level=1)
+    doc.add_paragraph(
+        "Determinar, mediante un programa desarrollado en Python, el caudal de "
+        "aire (m3/min) necesario en cada frente/nivel de una mina subterranea, "
+        "evaluando el requerimiento por personal, por potencia de equipo diesel "
+        "y por dilucion de gases de combustion, y establecer el caudal de diseno "
+        "de la mina como la suma de los caudales requeridos por cada frente, "
+        "afectados por un factor de fugas del circuito de ventilacion."
+    )
+
+    # ---------- MARCO NORMATIVO Y TEORICO ----------
+    doc.add_heading("3. Marco Normativo y Fundamento Tecnico", level=1)
+    doc.add_paragraph(
+        "El Art. 246 del D.S. N° 023-2017-EM establece un caudal minimo de aire "
+        f"fresco de {Q_MIN_PERSONA:.1f} m3/min por trabajador presente en el "
+        f"interior mina, y de {Q_MIN_HP_DIESEL:.1f} m3/min por cada HP de "
+        "potencia de motores de combustion interna (diesel) en operacion. "
+        "Adicionalmente, se evalua el caudal necesario para diluir los "
+        "principales gases de combustion (CO, NOx, CO2) hasta su Limite "
+        "Maximo Permisible (LMP), mediante la ecuacion de dilucion de "
+        "contaminantes:"
+    )
+    formula = doc.add_paragraph()
+    formula.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    formula.add_run("Q_dilucion = Q_actual x (C_medida - LMP) / (LMP - C_fondo)").italic = True
+    doc.add_paragraph(
+        "donde Q_actual es el caudal de aire (m3/min) medido con anemometro en "
+        "el frente al momento del muestreo, y C_medida es la concentracion del "
+        "gas contaminante leida con detector multigas en ese mismo punto (ambos "
+        "son datos de entrada de campo). El caudal de diseno de cada frente "
+        "corresponde al maximo de los tres criterios (personal, equipo diesel y "
+        "dilucion de gases), incrementado por un factor de fugas y perdidas del "
+        f"circuito de ventilacion de {(FACTOR_FUGAS - 1) * 100:.0f}%, valor tipico "
+        "para circuitos de mina subterranea con conductos y tapones de ventilacion."
+    )
+
+    tabla_lmp = [[gas, str(p["lmp_ppm"]), str(p["c_fondo_ppm"])]
+                 for gas, p in LMP_GASES.items()]
+    doc.add_paragraph("Limites Maximos Permisibles (LMP) y concentracion de fondo utilizados:")
+    _agregar_tabla(doc, ["Gas", "LMP (ppm)", "C. fondo (ppm)"], tabla_lmp)
+
+    # ---------- DATOS DE ENTRADA ----------
+    doc.add_heading("4. Datos de Entrada", level=1)
+    doc.add_paragraph(
+        f"Se analizaron {resultado_mina['n_frentes']} frentes/niveles activos, con "
+        f"un total de {resultado_mina['trabajadores_total']} trabajadores por "
+        f"guardia y {resultado_mina['hp_total_mina']:.0f} HP de potencia diesel "
+        "instalada. Por cada frente se registraron ademas el caudal de aire "
+        "actual (medido con anemometro) y las concentraciones de gases "
+        "contaminantes (medidas con detector multigas), segun exige la ficha "
+        "tecnica del tema."
+    )
+    filas_entrada = []
+    for f in frentes:
+        equipos_txt = "; ".join(f"{e.nombre} ({e.hp:.0f} HP)" for e in f.equipos) or "Sin equipo diesel"
+        gases_txt = "; ".join(f"{g}: {c:.1f} ppm" for g, c in f.concentraciones_gases_ppm.items()) or "Sin datos"
+        filas_entrada.append([f.nombre, f.nivel, str(f.n_trabajadores), equipos_txt,
+                               f"{f.caudal_actual_m3min:.0f}", gases_txt])
+    _agregar_tabla(doc,
+                    ["Frente", "Nivel", "N° Trabajadores\npor guardia", "Equipos diesel (HP)",
+                     "Q actual\nmedido (m3/min)", "Concentraciones de\ngases medidas (ppm)"],
+                    filas_entrada)
+
+    # ---------- MEMORIA DE CALCULO ----------
+    doc.add_heading("5. Memoria de Calculo y Resultados por Frente", level=1)
+    filas_resultado = []
+    for r in resultado_mina["resultados_frentes"]:
+        filas_resultado.append([
+            r["frente"], r["nivel"],
+            f"{r['q_personal']:.1f}", f"{r['q_diesel']:.1f}",
+            f"{r['q_gases_max']:.1f} ({r['gas_critico']})",
+            r["criterio_gobernante"],
+            f"{r['q_diseno']:.1f}",
+        ])
+    doc.add_paragraph(
+        "La siguiente tabla resume el caudal requerido por cada criterio (m3/min) "
+        "y el caudal de diseno final (con factor de fugas) para cada frente:"
+    )
+    _agregar_tabla(doc,
+                    ["Frente", "Nivel", "Q Personal", "Q Diesel", "Q Gases (critico)",
+                     "Criterio gobernante", "Q Diseno (m3/min)"],
+                    filas_resultado)
+
+    p_total = doc.add_paragraph()
+    p_total.add_run(
+        f"\nCaudal total de diseno de la mina: {resultado_mina['q_total_mina']:.1f} m3/min "
+        f"({resultado_mina['q_total_mina'] / 60:.2f} m3/s).\n"
+    ).bold = True
+
+    # ---------- GRAFICOS ----------
+    doc.add_heading("6. Graficos", level=1)
+    doc.add_paragraph("Comparacion de los tres criterios de caudal y el caudal de diseno, por frente:")
+    doc.add_picture(ruta_grafico_barras, width=Cm(16))
+    doc.add_paragraph("Distribucion de frentes segun el criterio gobernante:")
+    doc.add_picture(ruta_grafico_torta, width=Cm(10))
+
+    # ---------- CONCLUSIONES ----------
+    doc.add_heading("7. Conclusiones", level=1)
+    frentes_ordenados = sorted(resultado_mina["resultados_frentes"],
+                                key=lambda r: r["q_diseno"], reverse=True)
+    frente_critico = frentes_ordenados[0]
+    doc.add_paragraph(
+        f"- El caudal total de aire fresco requerido para la mina es de "
+        f"{resultado_mina['q_total_mina']:.1f} m3/min, considerando "
+        f"{resultado_mina['n_frentes']} frentes activos.\n"
+        f"- El frente mas exigente en terminos de ventilacion es "
+        f"'{frente_critico['frente']}' ({frente_critico['nivel']}), con un "
+        f"caudal de diseno de {frente_critico['q_diseno']:.1f} m3/min, "
+        f"gobernado por el criterio de {frente_critico['criterio_gobernante']}.\n"
+        "- En la mayoria de los frentes analizados, el criterio de equipo diesel "
+        "resulta determinante frente al de personal, debido a la baja dotacion "
+        "de personal tipica de la mineria mecanizada.\n"
+        "- El factor de fugas incorporado (25%) refleja la necesidad de "
+        "sobredimensionar el ventilador principal para compensar perdidas por "
+        "conductos, tapones y puertas de ventilacion."
+    )
+
+    doc.add_heading("8. Recomendaciones", level=1)
+    doc.add_paragraph(
+        "- Verificar periodicamente las concentraciones reales de gases de escape "
+        "mediante monitoreo con detectores multigas, y actualizar los factores de "
+        "emision utilizados en este programa segun la data real del parque de "
+        "equipos.\n"
+        "- Evaluar el circuito de ventilacion en conjunto (perdidas de carga, curva "
+        "del ventilador) para verificar que el ventilador principal seleccionado "
+        "pueda entregar el caudal total calculado a la presion requerida.\n"
+        "- Actualizar el calculo cada vez que se incorporen nuevos equipos diesel "
+        "o se modifique la dotacion de personal por frente.\n"
+        "- Contrastar los limites maximos permisibles (LMP) utilizados con la "
+        "version vigente del D.S. N° 023-2017-EM y sus modificatorias."
+    )
+
+    # ---------- MODULO DE CALIFICACION ----------
+    doc.add_heading("9. Modulo de Autoevaluacion segun Rubrica (Anexo 3)", level=1)
+    doc.add_paragraph(
+        "Este modulo es una demostracion de manejo de funciones, diccionarios y "
+        "generacion de reportes. No reemplaza la evaluacion del docente."
+    )
+    filas_rubrica = [[d["criterio"], str(d["puntos_maximos"]), str(d["puntos_obtenidos"])]
+                      for d in rubrica["detalle"]]
+    _agregar_tabla(doc, ["Criterio", "Puntaje maximo", "Puntaje obtenido"], filas_rubrica)
+    p_nota = doc.add_paragraph()
+    p_nota.add_run(f"\nNOTA FINAL (autoevaluacion): {rubrica['nota_final']} / 20 "
+                    f"- {rubrica['escala']}").bold = True
+
+    doc.save(ruta_salida)
+    print(f"[INFO] Informe Word generado: {ruta_salida}")
+
+
+# ==============================================================================
+# MODULO 5: GENERACION AUTOMATICA DE LIBRO EXCEL
+# ==============================================================================
+def _estilo_encabezado(celda):
+    celda.font = Font(bold=True, color="FFFFFF", name="Calibri")
+    celda.fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+def generar_libro_excel(frentes: List[Frente], resultado_mina: Dict,
+                         ruta_grafico_barras: str, rubrica: Dict, ruta_salida: str):
+    """Modulo 5 - Genera el libro de calculo en Excel (.xlsx) con formulas activas."""
+    wb = Workbook()
+
+    # ---------------- HOJA 1: Datos de entrada ----------------
+    ws1 = wb.active
+    ws1.title = "Datos_Entrada"
+    encabezados = ["Frente", "Nivel", "N Trabajadores", "Equipo Diesel", "HP",
+                   "Q actual medido (m3/min)"]
+    for j, h in enumerate(encabezados, start=1):
+        c = ws1.cell(row=1, column=j, value=h)
+        _estilo_encabezado(c)
+
+    fila = 2
+    fila_inicio_frente = {}
+    for f in frentes:
+        fila_inicio_frente[f.nombre] = fila
+        if f.equipos:
+            for idx_eq, e in enumerate(f.equipos):
+                ws1.cell(row=fila, column=1, value=f.nombre)
+                ws1.cell(row=fila, column=2, value=f.nivel)
+                ws1.cell(row=fila, column=3, value=f.n_trabajadores)
+                ws1.cell(row=fila, column=4, value=e.nombre)
+                ws1.cell(row=fila, column=5, value=e.hp)
+                if idx_eq == 0:
+                    ws1.cell(row=fila, column=6, value=f.caudal_actual_m3min)
+                fila += 1
+        else:
+            ws1.cell(row=fila, column=1, value=f.nombre)
+            ws1.cell(row=fila, column=2, value=f.nivel)
+            ws1.cell(row=fila, column=3, value=f.n_trabajadores)
+            ws1.cell(row=fila, column=4, value="(sin equipo diesel)")
+            ws1.cell(row=fila, column=5, value=0)
+            ws1.cell(row=fila, column=6, value=f.caudal_actual_m3min)
+            fila += 1
+    fila_fin_datos = fila - 1
+    for col, ancho in zip("ABCDEF", [26, 14, 16, 26, 10, 20]):
+        ws1.column_dimensions[col].width = ancho
+
+    # Constantes normativas (visibles y editables)
+    ws1.cell(row=1, column=7, value="Constantes normativas").font = Font(bold=True)
+    ws1.cell(row=2, column=7, value="Q min. por persona (m3/min)")
+    ws1.cell(row=2, column=8, value=Q_MIN_PERSONA)
+    ws1.cell(row=3, column=7, value="Q min. por HP diesel (m3/min)")
+    ws1.cell(row=3, column=8, value=Q_MIN_HP_DIESEL)
+    ws1.cell(row=4, column=7, value="Factor de fugas")
+    ws1.cell(row=4, column=8, value=FACTOR_FUGAS)
+    ws1.column_dimensions["G"].width = 30
+
+    fila_g = 6
+    ws1.cell(row=fila_g, column=7, value="Gas").font = Font(bold=True)
+    ws1.cell(row=fila_g, column=8, value="LMP (ppm)").font = Font(bold=True)
+    ws1.cell(row=fila_g, column=9, value="C. fondo (ppm)").font = Font(bold=True)
+    fila_gases_inicio = fila_g + 1
+    fila_g += 1
+    for gas, prop in LMP_GASES.items():
+        ws1.cell(row=fila_g, column=7, value=gas)
+        ws1.cell(row=fila_g, column=8, value=prop["lmp_ppm"])
+        ws1.cell(row=fila_g, column=9, value=prop["c_fondo_ppm"])
+        fila_g += 1
+    fila_gases_fin = fila_g - 1
+
+    # Concentraciones de gases MEDIDAS por frente (dato de entrada de campo)
+    ws1.cell(row=1, column=11, value="Frente").font = Font(bold=True)
+    ws1.cell(row=1, column=12, value="Gas").font = Font(bold=True)
+    ws1.cell(row=1, column=13, value="Concentracion medida (ppm)").font = Font(bold=True)
+    fila_conc = 2
+    for f in frentes:
+        for gas, valor in f.concentraciones_gases_ppm.items():
+            ws1.cell(row=fila_conc, column=11, value=f.nombre)
+            ws1.cell(row=fila_conc, column=12, value=gas)
+            ws1.cell(row=fila_conc, column=13, value=valor)
+            fila_conc += 1
+    for col, ancho in zip("KLM", [26, 10, 24]):
+        ws1.column_dimensions[col].width = ancho
+
+    # ---------------- HOJA 2: Memoria de calculo (con formulas) ----------------
+    ws2 = wb.create_sheet("Memoria_Calculo")
+    encabezados2 = ["Frente", "Nivel", "N Trabajadores", "HP Total",
+                    "Q Actual medido (m3/min)",
+                    "Q Personal (m3/min)", "Q Diesel (m3/min)",
+                    "Q Dilucion CO", "Q Dilucion NOx", "Q Dilucion CO2",
+                    "Q Criterio Max", "Q Diseno (m3/min)"]
+    for j, h in enumerate(encabezados2, start=1):
+        c = ws2.cell(row=1, column=j, value=h)
+        _estilo_encabezado(c)
+
+    fila2 = 2
+    for f in frentes:
+        fi = fila_inicio_frente[f.nombre]
+        n_equipos = max(len(f.equipos), 1)
+        ff = fi + n_equipos - 1  # ultima fila de ese frente en Datos_Entrada
+
+        ws2.cell(row=fila2, column=1, value=f"=Datos_Entrada!A{fi}")
+        ws2.cell(row=fila2, column=2, value=f"=Datos_Entrada!B{fi}")
+        ws2.cell(row=fila2, column=3, value=f"=Datos_Entrada!C{fi}")
+        ws2.cell(row=fila2, column=4, value=f"=SUM(Datos_Entrada!E{fi}:E{ff})")
+        # Q actual medido (caudal de aire presente al momento del muestreo de gases)
+        ws2.cell(row=fila2, column=5, value=f"=Datos_Entrada!F{fi}")
+
+        # Q personal = N trabajadores * Q_min_persona
+        ws2.cell(row=fila2, column=6, value=f"=C{fila2}*Datos_Entrada!$H$2")
+        # Q diesel = HP total * Q_min_HP
+        ws2.cell(row=fila2, column=7, value=f"=D{fila2}*Datos_Entrada!$H$3")
+
+        # Q dilucion por gas = Q_actual*(C_medida - LMP)/(LMP - C_fondo)
+        # C_medida se busca en la tabla de concentraciones (Datos_Entrada K:M)
+        # mediante SUMIFS (si el gas no fue medido en ese frente, devuelve 0,
+        # lo que da un requerimiento de dilucion de 0 para ese gas).
+        for k, gas in enumerate(LMP_GASES.keys()):
+            fila_gas_lmp = fila_gases_inicio + k
+            col = 8 + k  # H,I,J -> CO, NOx, CO2
+            c_medida = (f"SUMIFS(Datos_Entrada!$M:$M,Datos_Entrada!$K:$K,$A{fila2},"
+                        f"Datos_Entrada!$L:$L,\"{gas}\")")
+            lmp_ref = f"Datos_Entrada!$H${fila_gas_lmp}"
+            fondo_ref = f"Datos_Entrada!$I${fila_gas_lmp}"
+            ws2.cell(row=fila2, column=col,
+                     value=f"=MAX(0,$E{fila2}*({c_medida}-{lmp_ref})/({lmp_ref}-{fondo_ref}))")
+
+        # Q criterio max = MAX(personal, diesel, dilucion CO, NOx, CO2)
+        ws2.cell(row=fila2, column=11, value=f"=MAX(F{fila2}:J{fila2})")
+        # Q diseno = criterio max * factor de fugas
+        ws2.cell(row=fila2, column=12, value=f"=K{fila2}*Datos_Entrada!$H$4")
+
+        fila2 += 1
+
+    fila2_fin = fila2 - 1
+    ws2.cell(row=fila2 + 1, column=3, value="TOTAL MINA").font = Font(bold=True)
+    ws2.cell(row=fila2 + 1, column=12, value=f"=SUM(L2:L{fila2_fin})").font = Font(bold=True)
+
+    anchos2 = [24, 12, 14, 10, 16, 16, 14, 12, 12, 12, 14, 16]
+    for col_idx, ancho in enumerate(anchos2, start=1):
+        ws2.column_dimensions[get_column_letter(col_idx)].width = ancho
+
+    # ---------------- HOJA 3: Resultados y grafico ----------------
+    ws3 = wb.create_sheet("Resultados_Graficos")
+    ws3.cell(row=1, column=1, value="Frente").font = Font(bold=True)
+    ws3.cell(row=1, column=2, value="Q Diseno (m3/min)").font = Font(bold=True)
+    for i, r in enumerate(resultado_mina["resultados_frentes"], start=2):
+        ws3.cell(row=i, column=1, value=f"=Memoria_Calculo!A{i}")
+        ws3.cell(row=i, column=2, value=f"=Memoria_Calculo!L{i}")
+    ultima_fila = len(resultado_mina["resultados_frentes"]) + 1
+
+    chart = BarChart()
+    chart.title = "Caudal de diseno por frente (m3/min)"
+    chart.y_axis.title = "m3/min"
+    chart.x_axis.title = "Frente"
+    datos = Reference(ws3, min_col=2, min_row=1, max_row=ultima_fila)
+    categorias = Reference(ws3, min_col=1, min_row=2, max_row=ultima_fila)
+    chart.add_data(datos, titles_from_data=True)
+    chart.set_categories(categorias)
+    chart.width = 18
+    chart.height = 10
+    ws3.add_chart(chart, "D2")
+
+    try:
+        img = OpenpyxlImage(ruta_grafico_barras)
+        img.width, img.height = 700, 420
+        ws3.add_image(img, "D22")
+    except Exception:
+        pass
+
+    ws3.column_dimensions["A"].width = 26
+    ws3.column_dimensions["B"].width = 18
+
+    # ---------------- HOJA 4: Rubrica / Calificacion ----------------
+    ws4 = wb.create_sheet("Rubrica")
+    ws4.cell(row=1, column=1, value="Criterio").font = Font(bold=True)
+    ws4.cell(row=1, column=2, value="Puntaje maximo").font = Font(bold=True)
+    ws4.cell(row=1, column=3, value="Puntaje obtenido").font = Font(bold=True)
+    for i, d in enumerate(rubrica["detalle"], start=2):
+        ws4.cell(row=i, column=1, value=d["criterio"])
+        ws4.cell(row=i, column=2, value=d["puntos_maximos"])
+        ws4.cell(row=i, column=3, value=d["puntos_obtenidos"])
+    fila_total = len(rubrica["detalle"]) + 2
+    ws4.cell(row=fila_total, column=1, value="NOTA FINAL").font = Font(bold=True)
+    ws4.cell(row=fila_total, column=3, value=f"=SUM(C2:C{fila_total - 1})").font = Font(bold=True)
+    ws4.column_dimensions["A"].width = 55
+    ws4.column_dimensions["B"].width = 16
+    ws4.column_dimensions["C"].width = 16
+
+    wb.save(ruta_salida)
+    print(f"[INFO] Libro Excel generado: {ruta_salida}")
+
+
+# ==============================================================================
+# PROGRAMA PRINCIPAL
+# ==============================================================================
+def main():
+    print("=" * 78)
+    print(" CALCULO DEL CAUDAL DE AIRE REQUERIDO EN MINA SUBTERRANEA - TEMA N 30")
+    print("=" * 78)
+
+    argv = sys.argv[1:]
+
+    # Atajo: generar solo la plantilla de entrada y salir (no ejecuta el calculo)
+    if len(argv) > 0 and argv[0] == "--plantilla":
+        crear_plantilla_entrada()
+        return
+
+    # Modos de entrada disponibles (Modulo 1):
+    #   (sin argumentos)             -> se pregunta por terminal (menu interactivo)
+    #   datos_entrada.xlsx           -> lee ese archivo Excel
+    #   --csv <carpeta>              -> lee frentes.csv/equipos.csv/gases.csv
+    #   --teclado                    -> captura interactiva por consola
+    #   --gui                        -> formulario simple tkinter (un frente)
+    #   --plantilla                  -> genera plantilla_datos_entrada.xlsx y termina
+    #
+    # Si el programa se ejecuta sin argumentos (por ejemplo, con doble clic o
+    # con "python nombre_archivo.py"), se le pregunta al usuario en la
+    # terminal que metodo de entrada de datos desea usar.
+    if len(argv) == 0:
+        argv = solicitar_metodo_entrada_interactivo()
+        if argv == ["--plantilla"]:
+            crear_plantilla_entrada()
+            return
+
+    try:
+        # MODULO 1
+        frentes = obtener_datos_entrada(argv)
+
+        # MODULO 2
+        resultado_mina = calcular_caudal_mina(frentes)
+
+        # MODULO 3
+        ruta_barras = generar_grafico_caudales(resultado_mina)
+        ruta_torta = generar_grafico_torta_criterio(resultado_mina)
+
+        # MODULO 6 (calculado antes para incluir en los reportes)
+        rubrica = calificar_rubrica()
+
+        # MODULO 4
+        generar_informe_word(frentes, resultado_mina, ruta_barras, ruta_torta,
+                              rubrica, f"{NOMBRE_BASE}.docx")
+
+        # MODULO 5
+        generar_libro_excel(frentes, resultado_mina, ruta_barras, rubrica,
+                             f"{NOMBRE_BASE}.xlsx")
+
+        # Resumen en consola
+        print("\n" + "-" * 78)
+        print("RESUMEN DE RESULTADOS")
+        print("-" * 78)
+        df_resumen = pd.DataFrame(resultado_mina["resultados_frentes"])[
+            ["frente", "nivel", "n_trabajadores", "hp_total",
+             "q_personal", "q_diesel", "q_gases_max", "criterio_gobernante", "q_diseno"]
+        ]
+        pd.set_option("display.width", 140)
+        print(df_resumen.to_string(index=False))
+        print(f"\nCAUDAL TOTAL DE DISENO DE LA MINA: {resultado_mina['q_total_mina']:.1f} m3/min "
+              f"({resultado_mina['q_total_mina']/60:.2f} m3/s)")
+        print(f"NOTA FINAL (autoevaluacion segun rubrica): {rubrica['nota_final']} / 20 - {rubrica['escala']}")
+        print("\nArchivos generados:")
+        print(f"  - {NOMBRE_BASE}.docx")
+        print(f"  - {NOMBRE_BASE}.xlsx")
+        print(f"  - {ruta_barras}")
+        print(f"  - {ruta_torta}")
+
+    except Exception as e:
+        print(f"\n[ERROR CRITICO] El programa no pudo completar la ejecucion: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
