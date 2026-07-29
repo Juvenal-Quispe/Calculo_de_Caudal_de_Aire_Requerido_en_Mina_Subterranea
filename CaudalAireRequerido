@@ -769,7 +769,7 @@ def generar_informe_word(frentes: List[Frente], resultado_mina: Dict,
 
     datos_portada = [
         ("Estudiante:", "Quispe Huaccane Juvenal Fernando"),
-        ("Codigo:", "236661"),
+        ("Codigo:", " "),
         ("Docente:", "Edy Huanca Tito"),
         ("Fecha de entrega:", "Jueves 30 de julio de 2026"),
         ("Puno, Peru:", "2026"),
